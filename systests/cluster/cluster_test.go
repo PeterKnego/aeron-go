@@ -276,6 +276,45 @@ func TestClusterEchoAndSnapshot(t *testing.T) {
 	}
 }
 
+// TestClusterTimers verifies deterministic cluster timers, modeled on
+// upstream's ClusterTimerTest: a timer scheduled by the service (from within
+// session message processing) must expire through the replicated log and
+// reach OnTimerEvent; a cancelled timer must not fire.
+func TestClusterTimers(t *testing.T) {
+	driver := requireDriver(t)
+	defer driver.Stop()
+
+	runner := startServiceAgent(t, driver)
+	defer runner.shutdown()
+
+	clusterClient, collector := connectClient(t, driver)
+	defer clusterClient.Close()
+
+	// Schedule a short timer and a long one, then cancel the long one.
+	sendAndAwaitEchoes(t, clusterClient, collector, []string{
+		"timer:100:500",
+		"timer:101:60000",
+		"cancel-timer:101",
+	})
+
+	select {
+	case correlationId := <-runner.service.timerEvents:
+		if correlationId != 100 {
+			t.Errorf("expected timer 100 to fire, got %d", correlationId)
+		}
+	case <-time.After(15 * time.Second):
+		dumpClusterState(t, driver)
+		t.Fatal("timed out waiting for timer to fire")
+	}
+
+	// The cancelled timer must stay silent; watch briefly for stragglers.
+	select {
+	case correlationId := <-runner.service.timerEvents:
+		t.Errorf("unexpected timer fired: %d", correlationId)
+	case <-time.After(2 * time.Second):
+	}
+}
+
 // TestClusterRestartFromSnapshot verifies the recovery path: after a
 // snapshot and more messages, the cluster and the Go service container are
 // restarted over the same cluster and archive directories. The service must
