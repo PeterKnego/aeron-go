@@ -24,6 +24,7 @@ import (
 	"github.com/lirm/aeron-go/aeron"
 	atomicbuf "github.com/lirm/aeron-go/aeron/atomic"
 	"github.com/lirm/aeron-go/aeron/logbuffer"
+	"github.com/lirm/aeron-go/aeron/logging"
 	"github.com/lirm/aeron-go/cluster"
 	"github.com/lirm/aeron-go/cluster/client"
 	"go.uber.org/zap/zapcore"
@@ -122,23 +123,87 @@ func (runner *serviceRunner) shutdown() {
 
 func connectClient(t *testing.T, driver *ClusteredMediaDriver) (*client.AeronCluster, *egressCollector) {
 	t.Helper()
+	return connectClusterClient(t, driver, "0="+driver.IngressEndpoint)
+}
+
+// connectClusterClient connects a cluster client through the given driver's
+// media driver, with ingress publications to every listed member endpoint.
+func connectClusterClient(
+	t *testing.T,
+	driver *ClusteredMediaDriver,
+	ingressEndpoints string,
+) (*client.AeronCluster, *egressCollector) {
+	t.Helper()
 	clientOpts := client.NewOptions()
-	clientOpts.IngressChannel = "aeron:udp?alias=cluster-client-ingress|endpoint=" + driver.IngressEndpoint
-	clientOpts.IngressEndpoints = "0=" + driver.IngressEndpoint
+	clientOpts.IngressChannel = "aeron:udp?alias=cluster-client-ingress"
+	clientOpts.IngressEndpoints = ingressEndpoints
+	clientOpts.RetryBackoff = time.Second
+	if os.Getenv("CLUSTER_TEST_DEBUG") != "" {
+		// The client library never applies Options.Loglevel; set it directly.
+		logging.SetLevel(zapcore.DebugLevel, "cluster-client")
+	}
 	collector := &egressCollector{messages: make(chan string, 100)}
 	clusterClient, err := client.NewAeronCluster(aeron.NewContext().AeronDir(driver.AeronDir), clientOpts, collector)
 	if err != nil {
 		t.Fatalf("failed to create cluster client: %v", err)
 	}
+	awaitClientConnected(t, clusterClient, driver)
+	return clusterClient, collector
+}
+
+func awaitClientConnected(t *testing.T, clusterClient *client.AeronCluster, driver *ClusteredMediaDriver) {
+	t.Helper()
+	idler := client.NewOptions().IdleStrategy
 	deadline := time.Now().Add(60 * time.Second)
 	for !clusterClient.IsConnected() {
 		if time.Now().After(deadline) {
 			dumpClusterState(t, driver)
 			t.Fatal("timed out waiting for cluster client to connect")
 		}
-		clientOpts.IdleStrategy.Idle(clusterClient.Poll())
+		idler.Idle(clusterClient.Poll())
 	}
-	return clusterClient, collector
+}
+
+// awaitLeader returns the index of the runner whose node is the cluster
+// leader, waiting for an election to conclude if necessary.
+func awaitLeader(t *testing.T, runners []*serviceRunner, nodes []*ClusteredMediaDriver) int {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		for i, runner := range runners {
+			if runner != nil && runner.agent.Role() == cluster.Leader {
+				return i
+			}
+		}
+		if time.Now().After(deadline) {
+			for i, node := range nodes {
+				if runners[i] != nil {
+					t.Logf("--- node %d ---", i)
+					dumpClusterState(t, node)
+				}
+			}
+			t.Fatal("timed out waiting for a leader to be elected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// awaitAllMessageCounts waits until every live runner's service has processed
+// the expected number of messages, i.e. every node is caught up on the log.
+func awaitAllMessageCounts(t *testing.T, runners []*serviceRunner, expected int32) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for _, runner := range runners {
+		if runner == nil {
+			continue
+		}
+		for runner.service.messageCount.Load() != expected {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for all nodes to reach %d messages", expected)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 // dumpClusterState logs the consensus module's view of the cluster and the
@@ -172,7 +237,9 @@ func sendAndAwaitEchoes(
 	for _, payload := range payloads {
 		payloadBytes := []byte(payload)
 		sendBuf.PutBytesArray(0, &payloadBytes, 0, int32(len(payloadBytes)))
-		deadline := time.Now().Add(10 * time.Second)
+		// Generous deadline: after a leader kill the client may need several
+		// reconnect cycles before an offer can succeed.
+		deadline := time.Now().Add(30 * time.Second)
 		for clusterClient.Offer(sendBuf, 0, int32(len(payloadBytes))) < 0 {
 			if time.Now().After(deadline) {
 				t.Fatalf("timed out offering %q", payload)
@@ -313,6 +380,68 @@ func TestClusterTimers(t *testing.T) {
 		t.Errorf("unexpected timer fired: %d", correlationId)
 	case <-time.After(2 * time.Second):
 	}
+}
+
+// TestClusterMultiNodeFailover runs a three node cluster, each node a Java
+// ClusteredMediaDriver with a Go service container, and verifies leadership
+// failover: when the leader node is killed, a survivor must win the election,
+// the service containers must change role, and the client must reconnect and
+// continue to have messages served.
+func TestClusterMultiNodeFailover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping cluster system test in short mode")
+	}
+	if jar, ok := JarAvailable(); !ok {
+		t.Skipf("aeron-all jar not found at %s - see harness.go for fetch instructions", jar)
+	}
+	testCluster, err := StartTestCluster(3)
+	if err != nil {
+		t.Fatalf("failed to start test cluster: %v", err)
+	}
+	defer testCluster.Stop()
+
+	runners := make([]*serviceRunner, len(testCluster.Nodes))
+	for i, node := range testCluster.Nodes {
+		runners[i] = startServiceAgent(t, node)
+	}
+	defer func() {
+		for _, runner := range runners {
+			if runner != nil {
+				runner.stop.Store(true)
+			}
+		}
+	}()
+
+	leader := awaitLeader(t, runners, testCluster.Nodes)
+	t.Logf("leader is node %d", leader)
+
+	// Run the client via a follower's media driver so it survives the kill.
+	clientNode := testCluster.Nodes[(leader+1)%len(testCluster.Nodes)]
+	clusterClient, collector := connectClusterClient(t, clientNode, testCluster.IngressEndpoints)
+	defer clusterClient.Close()
+
+	sendAndAwaitEchoes(t, clusterClient, collector, payloads("before-failover", 5))
+	// Every node must be caught up before the kill, so the survivors hold
+	// the full log and can win the election.
+	awaitAllMessageCounts(t, runners, 5)
+
+	// Kill the leader node: stop its service container loop first (without
+	// closing, its driver is about to die under it), then the process.
+	runners[leader].stop.Store(true)
+	<-runners[leader].done
+	killed := runners[leader]
+	runners[leader] = nil
+	testCluster.Nodes[leader].Stop()
+	_ = killed
+
+	newLeader := awaitLeader(t, runners, testCluster.Nodes)
+	t.Logf("new leader is node %d", newLeader)
+
+	// The client must fail over to the new leader and messages must flow.
+	awaitClientConnected(t, clusterClient, testCluster.Nodes[newLeader])
+	sendAndAwaitEchoes(t, clusterClient, collector, payloads("after-failover", 5))
+
+	awaitAllMessageCounts(t, runners, 10)
 }
 
 // TestClusterRestartFromSnapshot verifies the recovery path: after a

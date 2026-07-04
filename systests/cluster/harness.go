@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -68,6 +69,8 @@ type ClusteredMediaDriver struct {
 	IngressEndpoint string
 	LogPath         string
 	basePort        int
+	memberId        int
+	clusterMembers  string
 	cmd             *exec.Cmd
 	exited          chan struct{}
 	exitErr         error
@@ -89,11 +92,64 @@ func JarAvailable() (string, bool) {
 }
 
 func StartClusteredMediaDriver() (*ClusteredMediaDriver, error) {
-	jar, ok := JarAvailable()
-	if !ok {
-		return nil, fmt.Errorf("aeron-all jar not found at %s", jar)
-	}
+	basePort := nextBasePort()
+	return launchNode(0, memberEndpoints(0, basePort), basePort)
+}
 
+// StartTestCluster launches a multi-node cluster; every node is a separate
+// ClusteredMediaDriver process with its own directories and port block.
+func StartTestCluster(nodeCount int) (*TestCluster, error) {
+	basePorts := make([]int, nodeCount)
+	members := make([]string, nodeCount)
+	ingress := make([]string, nodeCount)
+	for i := range basePorts {
+		basePorts[i] = nextBasePort()
+		members[i] = memberEndpoints(i, basePorts[i])
+		ingress[i] = fmt.Sprintf("%d=localhost:%d", i, basePorts[i])
+	}
+	membersString := strings.Join(members, "|")
+
+	testCluster := &TestCluster{IngressEndpoints: strings.Join(ingress, ",")}
+	for i := 0; i < nodeCount; i++ {
+		node, err := launchNode(i, membersString, basePorts[i])
+		if err != nil {
+			testCluster.Stop()
+			return nil, err
+		}
+		testCluster.Nodes = append(testCluster.Nodes, node)
+	}
+	return testCluster, nil
+}
+
+// TestCluster is a set of ClusteredMediaDriver nodes forming one cluster.
+type TestCluster struct {
+	Nodes            []*ClusteredMediaDriver
+	IngressEndpoints string
+}
+
+// Stop kills all remaining node processes and removes their directories.
+func (testCluster *TestCluster) Stop() {
+	for _, node := range testCluster.Nodes {
+		node.Stop()
+	}
+}
+
+// memberEndpoints renders one member's entry for the cluster members string:
+// id,ingress,consensus,log,catchup,archive.
+func memberEndpoints(memberId, basePort int) string {
+	return fmt.Sprintf("%d,localhost:%d,localhost:%d,localhost:%d,localhost:%d,localhost:%d",
+		memberId, basePort, basePort+1, basePort+2, basePort+3, basePort+10)
+}
+
+// Restart starts a new driver process over this driver's cluster and archive
+// directories, so the cluster recovers from its recording log and snapshots.
+// The driver must have been stopped with Shutdown first.
+func (driver *ClusteredMediaDriver) Restart() (*ClusteredMediaDriver, error) {
+	return launchDriver(driver.memberId, driver.clusterMembers, driver.AeronDir,
+		driver.ClusterDir, driver.ArchiveDir, driver.basePort)
+}
+
+func launchNode(memberId int, clusterMembers string, basePort int) (*ClusteredMediaDriver, error) {
 	id := uuid.New().String()
 	aeronDir := fmt.Sprintf("%s/aeron-%s/%s/driver", aeron.DefaultAeronDir, aeron.UserName, id)
 	baseDir, err := os.MkdirTemp("", "aeron-go-cluster-systest")
@@ -107,24 +163,15 @@ func StartClusteredMediaDriver() (*ClusteredMediaDriver, error) {
 	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
 		return nil, err
 	}
-	return launchDriver(aeronDir, clusterDir, archiveDir, nextBasePort())
+	return launchDriver(memberId, clusterMembers, aeronDir, clusterDir, archiveDir, basePort)
 }
 
-// Restart starts a new driver process over this driver's cluster and archive
-// directories, so the cluster recovers from its recording log and snapshots.
-// The driver must have been stopped with Shutdown first.
-func (driver *ClusteredMediaDriver) Restart() (*ClusteredMediaDriver, error) {
-	return launchDriver(driver.AeronDir, driver.ClusterDir, driver.ArchiveDir, driver.basePort)
-}
-
-func launchDriver(aeronDir, clusterDir, archiveDir string, basePort int) (*ClusteredMediaDriver, error) {
+func launchDriver(memberId int, clusterMembers, aeronDir, clusterDir, archiveDir string, basePort int) (*ClusteredMediaDriver, error) {
 	jar, ok := JarAvailable()
 	if !ok {
 		return nil, fmt.Errorf("aeron-all jar not found at %s", jar)
 	}
 
-	clusterMembers := fmt.Sprintf("0,localhost:%d,localhost:%d,localhost:%d,localhost:0,localhost:%d",
-		basePort, basePort+1, basePort+2, basePort+10)
 	archiveControl := fmt.Sprintf("aeron:udp?endpoint=localhost:%d", basePort+10)
 
 	cmd := exec.Command(
@@ -145,6 +192,7 @@ func launchDriver(aeronDir, clusterDir, archiveDir string, basePort int) (*Clust
 		"-Daeron.archive.threading.mode=SHARED",
 		fmt.Sprintf("-Daeron.cluster.dir=%s", clusterDir),
 		fmt.Sprintf("-Daeron.cluster.members=%s", clusterMembers),
+		fmt.Sprintf("-Daeron.cluster.member.id=%d", memberId),
 		"-Daeron.cluster.ingress.channel=aeron:udp?term-length=64k",
 		"-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0",
 		"-Daeron.cluster.service.count=1",
@@ -168,6 +216,8 @@ func launchDriver(aeronDir, clusterDir, archiveDir string, basePort int) (*Clust
 		IngressEndpoint: fmt.Sprintf("localhost:%d", basePort),
 		LogPath:         logPath,
 		basePort:        basePort,
+		memberId:        memberId,
+		clusterMembers:  clusterMembers,
 		cmd:             cmd,
 		exited:          make(chan struct{}),
 	}
