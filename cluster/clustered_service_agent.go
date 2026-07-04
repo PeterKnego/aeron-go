@@ -294,6 +294,14 @@ func (agent *ClusteredServiceAgent) checkForClockTick() bool {
 	nowMs := time.Now().UnixMilli()
 	if agent.cachedTimeMs != nowMs {
 		agent.cachedTimeMs = nowMs
+
+		// The driver reclaims the commit position counter when the consensus
+		// module dies; polling it forever would hang the container.
+		if agent.commitPosition != nil && agent.commitPosition.State() != counters.RecordAllocated {
+			agent.isServiceActive = false
+			panic("commit-pos counter unexpectedly closed, terminating")
+		}
+
 		if nowMs > agent.markFileUpdateDeadlineMs {
 			agent.markFileUpdateDeadlineMs = nowMs + markFileUpdateIntervalMs
 			agent.markFile.UpdateActivityTimestamp(nowMs)
