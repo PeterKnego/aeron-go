@@ -22,7 +22,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,26 +44,33 @@ const defaultJarName = "aeron-all-1.52.0.jar"
 
 const clusteredMediaDriverClassName = "io.aeron.cluster.ClusteredMediaDriver"
 
-// Single node member config, mirroring upstream's ClusterTestConstants. The
-// ports are derived from the pid so that back-to-back test invocations don't
-// race a previous driver's socket release.
-var (
-	basePort        = 20000 + 20*(os.Getpid()%1000)
-	ingressEndpoint = fmt.Sprintf("localhost:%d", basePort)
-	clusterMembers  = fmt.Sprintf("0,localhost:%d,localhost:%d,localhost:%d,localhost:0,localhost:%d",
-		basePort, basePort+1, basePort+2, basePort+10)
-	archiveControl = fmt.Sprintf("aeron:udp?endpoint=localhost:%d", basePort+10)
-)
+// Each driver instance gets its own port block, derived from the pid and an
+// instance counter: distinct test invocations and distinct drivers within one
+// test process never share ports, so a leaked client from a stopped cluster
+// cannot send stale traffic into the next one. Ports stay below 32768 so they
+// can't collide with the kernel's ephemeral port range (32768-60999 by
+// default). Restarts of the same driver deliberately reuse its block.
+var driverInstances atomic.Int32
+
+func nextBasePort() int {
+	instance := int(driverInstances.Add(1) - 1)
+	return 20000 + (os.Getpid()%100)*120 + (instance%6)*20
+}
 
 var logger = logging.MustGetLogger("clustertests")
 
 // ClusteredMediaDriver wraps a Java ClusteredMediaDriver child process and
 // the temp directories it runs in.
 type ClusteredMediaDriver struct {
-	AeronDir   string
-	ClusterDir string
-	ArchiveDir string
-	cmd        *exec.Cmd
+	AeronDir        string
+	ClusterDir      string
+	ArchiveDir      string
+	IngressEndpoint string
+	LogPath         string
+	basePort        int
+	cmd             *exec.Cmd
+	exited          chan struct{}
+	exitErr         error
 }
 
 func jarPath() string {
@@ -97,6 +107,25 @@ func StartClusteredMediaDriver() (*ClusteredMediaDriver, error) {
 	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
 		return nil, err
 	}
+	return launchDriver(aeronDir, clusterDir, archiveDir, nextBasePort())
+}
+
+// Restart starts a new driver process over this driver's cluster and archive
+// directories, so the cluster recovers from its recording log and snapshots.
+// The driver must have been stopped with Shutdown first.
+func (driver *ClusteredMediaDriver) Restart() (*ClusteredMediaDriver, error) {
+	return launchDriver(driver.AeronDir, driver.ClusterDir, driver.ArchiveDir, driver.basePort)
+}
+
+func launchDriver(aeronDir, clusterDir, archiveDir string, basePort int) (*ClusteredMediaDriver, error) {
+	jar, ok := JarAvailable()
+	if !ok {
+		return nil, fmt.Errorf("aeron-all jar not found at %s", jar)
+	}
+
+	clusterMembers := fmt.Sprintf("0,localhost:%d,localhost:%d,localhost:%d,localhost:0,localhost:%d",
+		basePort, basePort+1, basePort+2, basePort+10)
+	archiveControl := fmt.Sprintf("aeron:udp?endpoint=localhost:%d", basePort+10)
 
 	cmd := exec.Command(
 		"java",
@@ -123,20 +152,46 @@ func StartClusteredMediaDriver() (*ClusteredMediaDriver, error) {
 		jar,
 		clusteredMediaDriverClassName,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	setupPdeathsig(cmd)
-
-	logger.Infof("starting ClusteredMediaDriver: %s", cmd)
-	if err := cmd.Start(); err != nil {
+	logPath := fmt.Sprintf("%s/driver-%s.log", filepath.Dir(clusterDir), uuid.New().String()[:8])
+	logFile, err := os.Create(logPath)
+	if err != nil {
 		return nil, err
 	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	setupPdeathsig(cmd)
 
 	driver := &ClusteredMediaDriver{
-		AeronDir:   aeronDir,
-		ClusterDir: clusterDir,
-		ArchiveDir: archiveDir,
-		cmd:        cmd,
+		AeronDir:        aeronDir,
+		ClusterDir:      clusterDir,
+		ArchiveDir:      archiveDir,
+		IngressEndpoint: fmt.Sprintf("localhost:%d", basePort),
+		LogPath:         logPath,
+		basePort:        basePort,
+		cmd:             cmd,
+		exited:          make(chan struct{}),
+	}
+	logger.Infof("starting ClusteredMediaDriver (log: %s): %s", logPath, cmd)
+	// Pdeathsig is delivered when the forking OS thread dies, not the
+	// process, so the thread that starts the driver must stay alive for the
+	// driver's whole lifetime: keep it locked until the child exits.
+	started := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		if err := cmd.Start(); err != nil {
+			logFile.Close()
+			started <- err
+			return
+		}
+		started <- nil
+		driver.exitErr = cmd.Wait()
+		logFile.Close()
+		close(driver.exited)
+		logger.Infof("ClusteredMediaDriver pid=%d exited: %v", cmd.Process.Pid, driver.exitErr)
+	}()
+	if err := <-started; err != nil {
+		return nil, err
 	}
 	if err := driver.awaitMediaDriverReady(); err != nil {
 		driver.Stop()
@@ -145,11 +200,38 @@ func StartClusteredMediaDriver() (*ClusteredMediaDriver, error) {
 	return driver, nil
 }
 
+// Exited reports whether the driver process has terminated.
+func (driver *ClusteredMediaDriver) Exited() bool {
+	select {
+	case <-driver.exited:
+		return true
+	default:
+		return false
+	}
+}
+
+// Shutdown stops the driver process gracefully (so the consensus module and
+// archive close cleanly) and keeps the cluster and archive directories, ready
+// for a Restart.
+func (driver *ClusteredMediaDriver) Shutdown() {
+	if err := driver.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		logger.Errorf("couldn't signal ClusteredMediaDriver: %v", err)
+	}
+	select {
+	case <-driver.exited:
+	case <-time.After(15 * time.Second):
+		logger.Errorf("ClusteredMediaDriver did not shut down in time, killing")
+		_ = driver.cmd.Process.Kill()
+		<-driver.exited
+	}
+}
+
+// Stop kills the driver process and removes all its directories.
 func (driver *ClusteredMediaDriver) Stop() {
-	if err := driver.cmd.Process.Kill(); err != nil {
+	if err := driver.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		logger.Errorf("couldn't kill ClusteredMediaDriver: %v", err)
 	}
-	_, _ = driver.cmd.Process.Wait()
+	<-driver.exited
 	for _, dir := range []string{driver.AeronDir, driver.ClusterDir, driver.ArchiveDir} {
 		if err := os.RemoveAll(dir); err != nil {
 			logger.Errorf("failed to remove %s: %v", dir, err)
@@ -168,6 +250,23 @@ func (driver *ClusteredMediaDriver) awaitMediaDriverReady() error {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return errors.New("timed out waiting for ClusteredMediaDriver to start")
+}
+
+// ClusterTool runs an io.aeron.cluster.ClusterTool command (e.g. "snapshot",
+// "describe", "errors") against this driver's cluster directory.
+func (driver *ClusteredMediaDriver) ClusterTool(command string) (string, error) {
+	jar, _ := JarAvailable()
+	tool := exec.Command(
+		"java",
+		"--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+		"--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
+		"-cp", jar,
+		"io.aeron.cluster.ClusterTool",
+		driver.ClusterDir,
+		command,
+	)
+	out, err := tool.CombinedOutput()
+	return string(out), err
 }
 
 // Setting Pdeathsig kills the child process when the test process dies, but
