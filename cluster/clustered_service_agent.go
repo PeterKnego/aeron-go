@@ -678,6 +678,23 @@ func (agent *ClusteredServiceAgent) onRequestServiceAck(logPosition int64) {
 	agent.requestedAckPosition = logPosition
 }
 
+// Close terminates the service container and releases the aeron resources it
+// holds, so another agent can be started for the same cluster directory.
+func (agent *ClusteredServiceAgent) Close() {
+	agent.isServiceActive = false
+	if err := agent.logAdapter.Close(); err != nil {
+		logger.Errorf("error closing log adapter: %v", err)
+	}
+	closeSubscription(agent.serviceAdapter.subscription)
+	closePublication(agent.proxy.publication)
+	if err := agent.aeronClient.Close(); err != nil {
+		logger.Errorf("error closing aeron client: %v", err)
+	}
+	if err := agent.markFile.file.Close(); err != nil {
+		logger.Errorf("error closing mark file: %v", err)
+	}
+}
+
 func (agent *ClusteredServiceAgent) getAndIncrementNextAckId() int64 {
 	ackId := agent.nextAckId
 	agent.nextAckId++
