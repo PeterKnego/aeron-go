@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ master ]
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -22,3 +26,6 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: results.sarif
+        # Code scanning upload needs GitHub code scanning to be available on
+        # the repository; don't fail the whole workflow when it isn't.
+        continue-on-error: true
