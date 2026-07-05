@@ -49,6 +49,9 @@ type SysTestSuite struct {
 }
 
 func (suite *SysTestSuite) SetupTest() {
+	if jar, ok := driver.JarAvailable(); !ok {
+		suite.T().Skipf("aeron-all jar not found at %s - see media_driver.go for fetch instructions", jar)
+	}
 	mediaDriver, err := driver.StartMediaDriver()
 	suite.Require().NoError(err, "Couldn't start Media Driver: ")
 	suite.mediaDriver = mediaDriver

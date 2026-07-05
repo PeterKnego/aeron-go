@@ -41,6 +41,9 @@ type CounterTestSuite struct {
 }
 
 func (s *CounterTestSuite) SetupTest() {
+	if jar, ok := driver.JarAvailable(); !ok {
+		s.T().Skipf("aeron-all jar not found at %s - see media_driver.go for fetch instructions", jar)
+	}
 	mediaDriver, err := driver.StartMediaDriver()
 	s.Require().NoError(err, "Couldn't start Media Driver")
 	s.mediaDriver = mediaDriver

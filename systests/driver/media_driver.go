@@ -46,11 +46,34 @@ const aeronClientLivenessTimeoutNs = "aeron.client.liveness.timeout"
 // Must match Java's `PUBLICATION_UNBLOCK_TIMEOUT_PROP_NAME`, measured in nanos
 const aeronPublicationUnblockTimeoutNs = "aeron.publication.unblock.timeout"
 
-const jarName = "driver/aeron-all-1.43.0.jar"
+// The jar is not committed; it is shared with the cluster system tests. These
+// tests run with systests as their working directory, so the path reaches
+// into systests/cluster. Fetch it with:
+//
+//	curl -fLO --output-dir systests/cluster \
+//	  https://repo1.maven.org/maven2/io/aeron/aeron-all/1.52.0/aeron-all-1.52.0.jar
+//
+// or point AERON_ALL_JAR at an existing copy.
+const defaultJarName = "cluster/aeron-all-1.52.0.jar"
 
 const mediaDriverClassName = "io.aeron.driver.MediaDriver"
 
 var logger = logging.MustGetLogger("systests")
+
+func jarPath() string {
+	if path := os.Getenv("AERON_ALL_JAR"); path != "" {
+		return path
+	}
+	return defaultJarName
+}
+
+// JarAvailable reports whether the aeron-all jar needed to launch the driver
+// exists; tests should skip when it does not.
+func JarAvailable() (string, bool) {
+	path := jarPath()
+	_, err := os.Stat(path)
+	return path, err == nil
+}
 
 type MediaDriver struct {
 	TempDir string
@@ -59,6 +82,9 @@ type MediaDriver struct {
 }
 
 func StartMediaDriver() (*MediaDriver, error) {
+	if jar, ok := JarAvailable(); !ok {
+		return nil, fmt.Errorf("aeron-all jar not found at %s - see media_driver.go for fetch instructions", jar)
+	}
 	tempDir := aeronUniqueTempDir()
 	cmd := setupCmd(tempDir)
 	setupPdeathsig(cmd)
@@ -123,6 +149,7 @@ func setupCmd(tempDir string) *exec.Cmd {
 	cmd := exec.Command(
 		"java",
 		"--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+		"--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED",
 		fmt.Sprintf("-D%s=%s", aeronDirPropName, tempDir),
 		fmt.Sprintf("-D%s=true", aeronDirDeleteStartPropName),
 		fmt.Sprintf("-D%s=true", aeronDirDeleteShutdownPropName),
@@ -131,7 +158,7 @@ func setupCmd(tempDir string) *exec.Cmd {
 		"-XX:+UnlockDiagnosticVMOptions",
 		"-XX:GuaranteedSafepointInterval=300000",
 		"-cp",
-		jarName,
+		jarPath(),
 		mediaDriverClassName,
 	)
 	cmd.Stdout = os.Stdout
