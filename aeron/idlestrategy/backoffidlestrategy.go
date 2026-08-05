@@ -12,6 +12,10 @@ import (
 type BackoffIdleStrategy struct {
 	// configured max spins, yield, and min / max park period
 	maxSpins, maxYields, minParkPeriodNs, maxParkPeriodNs int64
+	// sleepFloorNs is the shortest park handed to time.Sleep; shorter parks
+	// yield to a deadline instead. Zero keeps the original always-sleep
+	// behaviour.
+	sleepFloorNs int64
 	// current state
 	state backoffState
 	// current number of spins, yield, and park period.
@@ -46,6 +50,40 @@ func NewDefaultBackoffIdleStrategy() *BackoffIdleStrategy {
 	return NewBackoffIdleStrategy(DefaultMaxSpins, DefaultMaxYields, DefaultMinParkNs, DefaultMaxParkNs)
 }
 
+// DefaultSleepFloorNs is the shortest park worth handing to time.Sleep.
+//
+// Go's runtime timer overshoots short sleeps by orders of magnitude: measured
+// on Linux/amd64, requests up to ~4µs cost ~6-10µs, but a 6µs request costs
+// ~425µs and anything from ~8µs upwards costs the same as a 1ms request. The
+// exact threshold moves with host and load, so this floor is set well above it.
+//
+// The consequence for the plain backoff ladder is that its 1µs->1ms doubling
+// does not ramp: by the fourth park it is already paying ~1ms, and every rung
+// above that is indistinguishable. maxParkPeriodNs is effectively inert.
+const DefaultSleepFloorNs = int64(time.Millisecond)
+
+// NewYieldingBackoffIdleStrategy returns a BackoffIdleStrategy that serves
+// parks shorter than sleepFloorNs by yielding to a deadline rather than
+// sleeping, so the ladder's short rungs are honoured instead of collapsing to
+// the runtime timer's granularity. Parks at or above the floor still sleep, so
+// a genuinely idle agent still releases its processor.
+//
+// This trades CPU for latency on the short rungs and suits a duty cycle whose
+// wakeup latency matters — a clustered service container, say. Prefer the plain
+// NewBackoffIdleStrategy for background agents that should stay cheap when idle.
+func NewYieldingBackoffIdleStrategy(maxSpins, maxYields, minParkPeriodNs, maxParkPeriodNs, sleepFloorNs int64) *BackoffIdleStrategy {
+	s := NewBackoffIdleStrategy(maxSpins, maxYields, minParkPeriodNs, maxParkPeriodNs)
+	s.sleepFloorNs = sleepFloorNs
+	return s
+}
+
+// NewDefaultYieldingBackoffIdleStrategy is NewYieldingBackoffIdleStrategy with
+// the default spin/yield/park parameters and DefaultSleepFloorNs.
+func NewDefaultYieldingBackoffIdleStrategy() *BackoffIdleStrategy {
+	return NewYieldingBackoffIdleStrategy(DefaultMaxSpins, DefaultMaxYields,
+		DefaultMinParkNs, DefaultMaxParkNs, DefaultSleepFloorNs)
+}
+
 type backoffState int8
 
 const (
@@ -68,8 +106,22 @@ func (s *BackoffIdleStrategy) Idle(workCount int) {
 }
 
 func (s *BackoffIdleStrategy) String() string {
-	return fmt.Sprintf("BackoffIdleStrategy(MaxSpins:%d, MaxYields:%d, MinParkPeriodNs:%d, MaxParkPeriodNs:%d)",
-		s.maxSpins, s.maxYields, s.minParkPeriodNs, s.maxParkPeriodNs)
+	return fmt.Sprintf("BackoffIdleStrategy(MaxSpins:%d, MaxYields:%d, MinParkPeriodNs:%d, MaxParkPeriodNs:%d, SleepFloorNs:%d)",
+		s.maxSpins, s.maxYields, s.minParkPeriodNs, s.maxParkPeriodNs, s.sleepFloorNs)
+}
+
+// park waits ns, yielding rather than sleeping when the wait is shorter than
+// sleepFloorNs — see DefaultSleepFloorNs for why a short time.Sleep is not
+// short.
+func (s *BackoffIdleStrategy) park(ns int64) {
+	if s.sleepFloorNs > 0 && ns < s.sleepFloorNs {
+		deadline := time.Now().Add(time.Duration(ns))
+		for time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		return
+	}
+	time.Sleep(time.Duration(ns))
 }
 
 func (s *BackoffIdleStrategy) reset() {
@@ -100,7 +152,7 @@ func (s *BackoffIdleStrategy) idle() {
 			runtime.Gosched()
 		}
 	case backoffParking:
-		time.Sleep(time.Nanosecond * time.Duration(s.parkPeriodNs))
+		s.park(s.parkPeriodNs)
 		s.parkPeriodNs = s.parkPeriodNs << 1
 		if s.parkPeriodNs > s.maxParkPeriodNs {
 			s.parkPeriodNs = s.maxParkPeriodNs
